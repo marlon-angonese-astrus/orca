@@ -1,5 +1,6 @@
+import { hostname } from 'node:os'
 import { taskProviderFailure } from '../../shared/work-items/task-provider-failure'
-import { CredentialDecryptionError } from '../credentials/integration-credential-file'
+import { botToolSignInFailureWords } from '../../shared/bot-tool-sign-in'
 import type {
   JiraConnectArgs,
   JiraConnectionStatus,
@@ -7,151 +8,122 @@ import type {
   JiraSiteSelection,
   JiraViewer
 } from '../../shared/jira/jira-types'
-import { clearAttachmentImagesForSite } from './attachments/image-cache'
-import { acquire, release } from './request-queue'
+import { signOutBotTool } from '../bots/tool-oauth/bot-tool-oauth-revoke'
+import { createBotToolSignIn } from '../bots/tool-oauth/bot-tool-oauth-sign-in'
 import {
-  getCredentialError,
-  deleteToken,
-  getSiteFile,
-  hasStoredToken,
-  readToken,
-  saveToken,
-  writeSiteFile,
-  getSiteTokenProtection
-} from './site-credential-store'
+  botToolSignInProgress,
+  cancelBotToolSignIn,
+  connectBotToolSignIn
+} from '../bots/tool-oauth/bot-tool-sign-in-flows'
+import { BotToolSignInError } from '../bots/tool-oauth/bot-tool-oauth'
 import {
-  apiBasePath,
-  authHeader,
-  JiraApiError,
-  jiraRequest,
-  type JiraClientForSite
-} from './authenticated-request'
+  ASTRUSFLOW_MCP_URL,
+  ASTRUSFLOW_SITE_ID,
+  ASTRUSFLOW_SITE_URL
+} from '../../shared/jira/astrusflow-site'
 import {
-  getSiteId,
-  normalizeJiraSiteUrl,
-  resolveJiraAuthType,
-  siteToViewer,
-  toViewer
-} from './site-identity'
-import { verifyJiraCredentials } from './credential-verification'
+  astrusFlowOAuthKey,
+  astrusFlowSignInState,
+  callAstrusFlowTool
+} from './astrusflow-mcp-client'
+import { getSiteFile, writeSiteFile } from './site-credential-store'
+import { JiraApiError, type JiraClientForSite } from './authenticated-request'
+import { siteToViewer } from './site-identity'
+
+const SIGN_IN_POLL_MS = 500
 
 export function getClients(selection?: JiraSiteSelection | null): JiraClientForSite[] {
   const file = getSiteFile()
   const selected = selection ?? file.selectedSiteId ?? file.activeSiteId
-  const isAllSelection = selected === 'all'
-  const sites = isAllSelection
-    ? file.sites
-    : file.sites.filter((site) => site.id === (selected ?? file.activeSiteId))
-
-  return sites.flatMap((site) => {
-    let token: string | null
-    try {
-      token = readToken(site.id)
-    } catch (error) {
-      // For all-sites reads, skip unreadable credentials; explicit site reads still throw and status retains the error.
-      if (isAllSelection && error instanceof CredentialDecryptionError) {
-        return []
-      }
-      throw error
-    }
-    return token ? [{ site, authorization: authHeader(site.email, token, site.authType) }] : []
-  })
+  const sites =
+    selected === 'all'
+      ? file.sites
+      : file.sites.filter((site) => site.id === (selected ?? file.activeSiteId))
+  // The OAuth bearer is attached by the MCP client, so there is no per-site authorization header.
+  return sites.map((site) => ({ site, authorization: '' }))
 }
 
 export function getStatus(): JiraConnectionStatus {
   const file = getSiteFile()
-  const sites = file.sites.filter((site) => hasStoredToken(site.id))
-  const activeSite = sites.find((site) => site.id === file.activeSiteId) ?? sites[0] ?? null
-  const credentialError = sites
-    .map((site) => getCredentialError(site.id))
-    .find((message) => message !== undefined)
-  // Protection is host-wide: inactive sites with plaintext credentials still matter.
-  const credentialProtection = sites.some((site) => getSiteTokenProtection(site.id) === 'plaintext')
-    ? 'plaintext'
-    : null
+  const activeSite =
+    file.sites.find((site) => site.id === file.activeSiteId) ?? file.sites[0] ?? null
+  const { error } = astrusFlowSignInState()
   return {
-    connected: sites.length > 0,
+    connected: file.sites.length > 0,
     viewer: siteToViewer(activeSite),
-    sites,
+    sites: file.sites,
     activeSiteId: activeSite?.id ?? null,
     selectedSiteId: file.selectedSiteId ?? activeSite?.id ?? null,
-    ...(credentialError ? { credentialError } : {}),
-    credentialProtection,
+    ...(error ? { credentialError: error } : {}),
+    // The bot-tool store refuses to hold tokens it cannot seal, so nothing sits in plaintext.
+    credentialProtection: null,
     supportsScopedTokens: true
   }
 }
 
-export async function connect(
-  args: JiraConnectArgs
-): Promise<{ ok: true; viewer: JiraViewer } | { ok: false; error: string }> {
-  let siteUrl: string
-  try {
-    siteUrl = normalizeJiraSiteUrl(args.siteUrl)
-  } catch {
-    return taskProviderFailure('jira.invalidSiteUrl', 'Enter a valid Jira site URL.')
-  }
-
-  const authType = resolveJiraAuthType(siteUrl, args.authType)
-  const email = args.email.trim()
-  const apiToken = args.apiToken.trim()
-  if (authType === 'server') {
-    if (!apiToken) {
-      // A username present means classic Basic auth (password); its absence
-      // means the credential is a personal access token sent as Bearer.
-      return email
-        ? taskProviderFailure('jira.passwordRequired', 'Password is required.')
-        : taskProviderFailure('jira.personalTokenRequired', 'Personal access token is required.')
+/** Waits for the browser sign-in the flow started; resolves with the failure message, or null once signed in. */
+async function waitForSignIn(): Promise<string | null> {
+  const key = astrusFlowOAuthKey()
+  for (;;) {
+    const progress = botToolSignInProgress(key)
+    if (progress.state === 'done') {
+      return null
     }
-  } else if (!apiToken) {
-    return taskProviderFailure('jira.apiTokenRequired', 'API token is required.')
-  }
-
-  await acquire()
-  try {
-    const { viewer, apiBaseUrl } = await verifyJiraCredentials(siteUrl, email, apiToken, authType)
-    // PAT sites lack email; verified viewer identity prevents same-host account collisions.
-    const id = getSiteId(siteUrl, email || viewer.accountId)
-    const site: JiraSite = {
-      id,
-      siteUrl,
-      email,
-      displayName: viewer.displayName,
-      accountId: viewer.accountId,
-      authType,
-      ...(apiBaseUrl ? { apiBaseUrl } : {})
+    if (progress.state === 'failed') {
+      return botToolSignInFailureWords(progress.code, hostname())
     }
-    clearAttachmentImagesForSite(id)
-    saveToken(id, apiToken)
-    const file = getSiteFile()
-    writeSiteFile({
-      version: 1,
-      activeSiteId: id,
-      selectedSiteId: id,
-      sites: [site, ...file.sites.filter((entry) => entry.id !== id)]
-    })
-    return { ok: true, viewer }
-  } catch (error) {
-    return error instanceof Error
-      ? { ok: false, error: error.message }
-      : taskProviderFailure('jira.connectionFailed', 'Connection failed.')
-  } finally {
-    release()
+    if (progress.state === 'idle') {
+      return botToolSignInFailureWords('cancelled', hostname())
+    }
+    await new Promise((resolve) => setTimeout(resolve, SIGN_IN_POLL_MS))
   }
 }
 
-export function disconnect(siteId?: string): void {
-  const file = getSiteFile()
-  const ids = siteId ? [siteId] : file.sites.map((site) => site.id)
-  for (const id of ids) {
-    deleteToken(id)
+// AstrusFlow has no whoami tool and `my_work` does not name the user, so the viewer is generic.
+const VIEWER: JiraViewer = { accountId: 'me', displayName: 'AstrusFlow', email: null }
+
+// Args are ignored: the sign-in is OAuth in the browser, not credentials typed into Orca.
+export async function connect(
+  _args?: JiraConnectArgs
+): Promise<{ ok: true; viewer: JiraViewer } | { ok: false; error: string }> {
+  const key = astrusFlowOAuthKey()
+  try {
+    await createBotToolSignIn(key, ASTRUSFLOW_MCP_URL)
+    await connectBotToolSignIn(key)
+    const failure = await waitForSignIn()
+    if (failure) {
+      return { ok: false, error: failure }
+    }
+    await callAstrusFlowTool('my_work')
+    const site: JiraSite = {
+      id: ASTRUSFLOW_SITE_ID,
+      siteUrl: ASTRUSFLOW_SITE_URL,
+      email: '',
+      displayName: VIEWER.displayName,
+      accountId: VIEWER.accountId,
+      authType: 'cloud'
+    }
+    writeSiteFile({
+      version: 1,
+      activeSiteId: site.id,
+      selectedSiteId: site.id,
+      sites: [site]
+    })
+    return { ok: true, viewer: VIEWER }
+  } catch (error) {
+    cancelBotToolSignIn(key)
+    if (error instanceof BotToolSignInError) {
+      return { ok: false, error: botToolSignInFailureWords(error.code, hostname()) }
+    }
+    return error instanceof Error
+      ? { ok: false, error: error.message }
+      : taskProviderFailure('jira.connectionFailed', 'Connection failed.')
   }
-  clearAttachmentImagesForSite(siteId)
-  writeSiteFile({
-    version: 1,
-    activeSiteId: file.activeSiteId,
-    selectedSiteId: file.selectedSiteId,
-    sites: file.sites.filter((site) => !ids.includes(site.id))
-  })
+}
+
+export function disconnect(_siteId?: string): void {
+  clearToken(ASTRUSFLOW_SITE_ID)
+  void signOutBotTool(astrusFlowOAuthKey())
 }
 
 export function selectSite(siteId: JiraSiteSelection): JiraConnectionStatus {
@@ -170,41 +142,34 @@ export function selectSite(siteId: JiraSiteSelection): JiraConnectionStatus {
 export async function testConnection(
   siteId?: string
 ): Promise<{ ok: true; viewer: JiraViewer } | { ok: false; error: string }> {
-  let client: JiraClientForSite | undefined
-  try {
-    client = getClients(siteId)[0]
-  } catch (error) {
-    return error instanceof Error
-      ? { ok: false, error: error.message }
-      : taskProviderFailure('jira.connectionFailed', 'Connection failed.')
-  }
-  if (!client) {
+  if (!getClients(siteId)[0]) {
     return taskProviderFailure('jira.notConnected', 'Not connected to Jira.')
   }
-  await acquire()
   try {
-    const viewer = toViewer(
-      (await jiraRequest(client, `${apiBasePath(client.site)}/myself`)) as Record<string, unknown>,
-      client.site.email
-    )
-    return { ok: true, viewer }
+    await callAstrusFlowTool('my_work')
+    return { ok: true, viewer: VIEWER }
   } catch (error) {
     return error instanceof Error
       ? { ok: false, error: error.message }
       : taskProviderFailure('jira.connectionFailed', 'Connection failed.')
-  } finally {
-    release()
   }
 }
 
+/** Forgets the saved site; the OAuth sign-in itself is ended by `disconnect`. */
 export function clearToken(siteId: string): void {
-  deleteToken(siteId)
-  clearAttachmentImagesForSite(siteId)
   const file = getSiteFile()
   writeSiteFile({ ...file, sites: file.sites.filter((site) => site.id !== siteId) })
 }
 
+/** Calls a tool for the connected site; the OAuth sign-in state, not the site file, decides when it is gone. */
+export function callSiteTool(
+  name: string,
+  args: Record<string, unknown> = {},
+  signal?: AbortSignal
+): Promise<unknown> {
+  return callAstrusFlowTool(name, args, signal)
+}
+
 export function isAuthError(error: unknown): boolean {
-  // Jira 403 may mean missing project permissions; only an unscoped 401 invalidates the credential.
-  return error instanceof JiraApiError && error.status === 401 && !error.scopeMismatch
+  return error instanceof JiraApiError && error.status === 401
 }

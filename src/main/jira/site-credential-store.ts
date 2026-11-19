@@ -1,14 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { writeEncryptedCredential } from '../credentials/integration-credential-file'
-import { readCredentialFileProtection } from '../credentials/credential-file-protection'
-import type { SecretAtRestProtection } from '../../shared/secure-storage/secret-at-rest-protection'
 import type { JiraSite, JiraSiteSelection } from '../../shared/jira/jira-types'
 import { createIntegrationStateFileCache } from '../credentials/integration-state-file-cache'
-import { isJiraGatewayBaseUrl } from './gateway-base-url'
-import { resolveJiraAuthType } from './site-identity'
-import { createIntegrationTokenFileCache } from '../credentials/integration-token-file-cache'
+import { ASTRUSFLOW_SITE_ID, ASTRUSFLOW_SITE_URL } from '../../shared/jira/astrusflow-site'
+import { astrusFlowSignInState } from './astrusflow-mcp-client'
 
 export type JiraSiteFile = {
   version: 1
@@ -21,11 +17,6 @@ const siteFileCache = createIntegrationStateFileCache({
   filePath: getSiteFilePath,
   readFromDisk: readSiteFileFromDisk
 })
-const tokenFileCache = createIntegrationTokenFileCache({ service: 'Jira', filePath: getTokenPath })
-
-export function getCredentialError(siteId: string): string | undefined {
-  return tokenFileCache.error(siteId)
-}
 
 function getOrcaDir(): string {
   return join(homedir(), '.orca')
@@ -35,23 +26,13 @@ function getSiteFilePath(): string {
   return join(getOrcaDir(), 'jira-sites.json')
 }
 
+/** Legacy Jira REST token folder; still swept by the plaintext-credential migration. */
 export function getTokenDir(): string {
   return join(getOrcaDir(), 'jira-tokens')
 }
 
-function getTokenPath(siteId: string): string {
-  return join(getTokenDir(), `${Buffer.from(siteId).toString('base64url')}.enc`)
-}
-
 function ensureOrcaDir(): void {
   const dir = getOrcaDir()
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true })
-  }
-}
-
-function ensureTokenDir(): void {
-  const dir = getTokenDir()
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true })
   }
@@ -66,45 +47,26 @@ function emptySiteFile(): JiraSiteFile {
   }
 }
 
-export function hasStoredToken(siteId: string): boolean {
-  return tokenFileCache.has(siteId)
-}
-
+// Sites saved by the Jira REST backend carry other ids and are dropped on read.
 function normalizeSite(input: unknown): JiraSite | null {
   if (!input || typeof input !== 'object') {
     return null
   }
   const record = input as Record<string, unknown>
   if (
-    typeof record.id !== 'string' ||
-    typeof record.siteUrl !== 'string' ||
-    typeof record.email !== 'string' ||
+    record.id !== ASTRUSFLOW_SITE_ID ||
     typeof record.displayName !== 'string' ||
     typeof record.accountId !== 'string'
   ) {
     return null
   }
-  if (record.apiBaseUrl !== undefined && !isJiraGatewayBaseUrl(record.apiBaseUrl)) {
-    return null
-  }
-  // An emailless server record is a PAT site; coercing it to Cloud would drop it and orphan its token.
-  const authType =
-    record.authType === 'server' && !record.email
-      ? 'server'
-      : resolveJiraAuthType(record.siteUrl, record.authType)
-  if (authType !== 'server' && !record.email && !isJiraGatewayBaseUrl(record.apiBaseUrl)) {
-    return null
-  }
   return {
-    id: record.id,
-    siteUrl: record.siteUrl,
-    email: record.email,
+    id: ASTRUSFLOW_SITE_ID,
+    siteUrl: ASTRUSFLOW_SITE_URL,
+    email: '',
     displayName: record.displayName,
     accountId: record.accountId,
-    authType,
-    ...(authType !== 'server' && isJiraGatewayBaseUrl(record.apiBaseUrl)
-      ? { apiBaseUrl: record.apiBaseUrl }
-      : {})
+    authType: 'cloud'
   }
 }
 
@@ -120,17 +82,8 @@ function readSiteFileFromDisk(): JiraSiteFile {
           .map((site) => normalizeSite(site))
           .filter((site): site is JiraSite => site !== null)
       : []
-    const activeSiteId =
-      typeof parsed.activeSiteId === 'string' &&
-      sites.some((site) => site.id === parsed.activeSiteId)
-        ? parsed.activeSiteId
-        : (sites[0]?.id ?? null)
-    const selectedSiteId =
-      parsed.selectedSiteId === 'all' ||
-      (typeof parsed.selectedSiteId === 'string' &&
-        sites.some((site) => site.id === parsed.selectedSiteId))
-        ? parsed.selectedSiteId
-        : activeSiteId
+    const activeSiteId = sites[0]?.id ?? null
+    const selectedSiteId = parsed.selectedSiteId === 'all' ? 'all' : activeSiteId
     return { version: 1, activeSiteId, selectedSiteId, sites }
   } catch {
     return emptySiteFile()
@@ -138,22 +91,14 @@ function readSiteFileFromDisk(): JiraSiteFile {
 }
 
 export function getSiteFile(): JiraSiteFile {
-  const file = siteFileCache.get()
-  return selectableSiteFile(file)
+  return selectableSiteFile(siteFileCache.get())
 }
 
+// The site is only selectable while its OAuth sign-in stands.
 function selectableSiteFile(file: JiraSiteFile): JiraSiteFile {
-  const sites = file.sites.filter((site) => hasStoredToken(site.id))
-  const activeSiteId =
-    file.activeSiteId && sites.some((site) => site.id === file.activeSiteId)
-      ? file.activeSiteId
-      : (sites[0]?.id ?? null)
-  const selectedSiteId =
-    file.selectedSiteId === 'all'
-      ? 'all'
-      : file.selectedSiteId && sites.some((site) => site.id === file.selectedSiteId)
-        ? file.selectedSiteId
-        : activeSiteId
+  const sites = astrusFlowSignInState().signedIn ? file.sites : []
+  const activeSiteId = sites[0]?.id ?? null
+  const selectedSiteId = file.selectedSiteId === 'all' && activeSiteId ? 'all' : activeSiteId
 
   return {
     version: 1,
@@ -165,34 +110,9 @@ function selectableSiteFile(file: JiraSiteFile): JiraSiteFile {
 
 export function writeSiteFile(file: JiraSiteFile): void {
   ensureOrcaDir()
-  const next = selectableSiteFile(file)
-  writeFileSync(getSiteFilePath(), JSON.stringify(next, null, 2), {
+  writeFileSync(getSiteFilePath(), JSON.stringify(file, null, 2), {
     encoding: 'utf-8',
     mode: 0o600
   })
   siteFileCache.invalidate()
-}
-
-export function readToken(siteId: string): string | null {
-  return tokenFileCache.read(siteId)
-}
-
-/** How a site's stored token sits on disk, or null when none is stored. */
-export function getSiteTokenProtection(siteId: string): SecretAtRestProtection | null {
-  return readCredentialFileProtection(getTokenPath(siteId))
-}
-
-export function saveToken(siteId: string, apiToken: string): void {
-  ensureOrcaDir()
-  ensureTokenDir()
-  writeEncryptedCredential('Jira', getTokenPath(siteId), apiToken)
-  // The next action reads the actual file, including any overlapping writer's replacement.
-  tokenFileCache.forget(siteId)
-}
-
-export function deleteToken(siteId: string): void {
-  tokenFileCache.forget(siteId)
-  try {
-    unlinkSync(getTokenPath(siteId))
-  } catch {}
 }
